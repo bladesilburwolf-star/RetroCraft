@@ -1,0 +1,11 @@
+{
+  "mapsDir": "C:/Users/jwgreer/unrealcraft/out/ue1_maps",
+  "glbDir": "C:/Users/jwgreer/unrealcraft/out/ue1_maps",
+  "defaultScale": 75.0,
+  "mapUnitsPerBlock": 70.0,
+  "mapRotX": 0,
+  "mapRotY": 0,
+  "mapRotZ": 0,
+  "buildCollision": true,
+  "collisionBlockLimit": 250000
+}

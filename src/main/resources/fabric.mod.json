@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "unrealcraft",
+  "version": "${version}",
+  "name": "Unrealcraft",
+  "description": "Unreal Engine 1 assets (GLB props) in Minecraft Fabric 1.21.1",
+  "authors": ["AI + user"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.unrealcraft.Unrealcraft"],
+    "client": ["com.unrealcraft.UnrealcraftClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
