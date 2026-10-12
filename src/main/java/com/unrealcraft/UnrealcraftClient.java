@@ -1,0 +1,65 @@
+package com.unrealcraft;
+
+import com.unrealcraft.client.MapSelectScreen;
+import com.unrealcraft.client.UePropRenderer;
+import com.unrealcraft.client.halflife.HalfLifeMapRenderer;
+import com.unrealcraft.client.quake3.Quake3MapRenderer;
+import com.unrealcraft.client.retro.Sm64MobRenderer;
+import com.unrealcraft.client.retro.Sm64Collectibles;
+import com.unrealcraft.map.MapRegistry;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.fabricmc.fabric.api.client.screen.v1.Screens;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.text.Text;
+import net.minecraft.client.util.InputUtil;
+import org.lwjgl.glfw.GLFW;
+
+public class UnrealcraftClient implements ClientModInitializer {
+    private static KeyBinding openMapsKey;
+
+    @Override
+    public void onInitializeClient() {
+        EntityRendererRegistry.register(ModEntities.UE_PROP, UePropRenderer::new);
+        EntityRendererRegistry.register(ModEntities.HL1_MAP, HalfLifeMapRenderer::new);
+        EntityRendererRegistry.register(ModEntities.Q3_MAP, Quake3MapRenderer::new);
+        EntityRendererRegistry.register(ModEntities.SM64_MOB, Sm64MobRenderer::new);
+        MapRegistry.reload();
+        com.unrealcraft.client.retro.RetroMapClient.init();
+
+        openMapsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.unrealcraft.maps",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_K,
+                "category.unrealcraft"
+        ));
+
+        ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
+            if (!(screen instanceof GameMenuScreen) || client.player == null
+                    || !com.unrealcraft.client.retro.RetroMapClient.hasSm64Map()) return;
+
+            String label = com.unrealcraft.client.retro.MarioClient.isEnabled()
+                    ? "Enter Build Mode" : "Enter Mario Mode";
+            Screens.getButtons(screen).add(ButtonWidget.builder(Text.literal(label), button -> {
+                if (client.player != null) {
+                    client.player.networkHandler.sendChatCommand("sm64 mario");
+                    client.setScreen(null);
+                }
+            }).dimensions(scaledWidth / 2 - 100, scaledHeight - 28, 200, 20).build());
+        });
+
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while (openMapsKey.wasPressed()) {
+                if (client.player != null && client.currentScreen == null) {
+                    client.setScreen(new MapSelectScreen(null));
+                }
+            }
+            Sm64Collectibles.tick();
+        });
+    }
+}

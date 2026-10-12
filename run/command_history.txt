@@ -1,0 +1,3 @@
+/sm64 dir "C:/Users/jwgreer/sm64"
+/sm64 load bob
+/sm64 unload

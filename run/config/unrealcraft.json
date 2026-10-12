@@ -1,0 +1,16 @@
+{
+  "mapsDir": "/home/jwgreer/ue1",
+  "glbDir": "/home/jwgreer/ue1",
+  "defaultScale": 75.0,
+  "mapSeaY": 63,
+  "q3UnitsPerBlock": 32.0,
+  "mapUnitsPerBlock": 70.0,
+  "mapRotX": 0.0,
+  "mapRotY": 0.0,
+  "mapRotZ": 0.0,
+  "buildCollision": true,
+  "collisionBlockLimit": 250000,
+  "retroRenderRadius": 192.0,
+  "sm64Dir": "/home/jwgreer/smc64",
+  "sm64UnitsPerBlock": 100.0
+}
