@@ -47,6 +47,13 @@ public class Quake3MapEntity extends Entity {
     }
 
     @Override
+    public void tick() {
+        super.tick();
+        // legacy entity from older saves; maps are now drawn client-side
+        if (!getWorld().isClient) discard();
+    }
+
+    @Override
     public boolean shouldRender(double distance) {
         return distance < 512.0 * 512.0;
     }

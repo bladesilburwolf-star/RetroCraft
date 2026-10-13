@@ -7,6 +7,7 @@ import com.google.gson.JsonParser;
 import com.unrealcraft.Unrealcraft;
 import com.unrealcraft.HalfLifeMapLoader;
 import com.unrealcraft.Quake3MapLoader;
+import com.unrealcraft.Sm64MapLoader;
 import com.unrealcraft.config.UnrealConfig;
 import com.unrealcraft.entity.UePropEntity;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -33,6 +34,8 @@ public final class MapLoader {
     private MapLoader() {}
 
     public static void clear(ServerWorld world) {
+        Quake3MapLoader.clear(world);
+        Sm64MapLoader.clear(world);
         for (UUID id : new ArrayList<>(LOADED)) {
             var e = world.getEntity(id);
             if (e != null) e.discard();
@@ -51,6 +54,13 @@ public final class MapLoader {
         if (map.path() != null) {
             String fmt = map.format() == null ? "" : map.format();
             String abs = map.path().toAbsolutePath().toString();
+            if ("sm64".equals(fmt)) {
+                String id = map.id();
+                int cut = id.lastIndexOf('_');
+                int area = 1;
+                try { area = Integer.parseInt(id.substring(cut + 1)); } catch (Exception ignored) {}
+                return Sm64MapLoader.load(player.getCommandSource(), map.path().getFileName().toString(), area);
+            }
             if ("pk3".equals(fmt)) {
                 return Quake3MapLoader.load(player.getCommandSource(), abs);
             }

@@ -16,10 +16,12 @@ public class Unrealcraft implements ModInitializer {
         UnrealConfig.load();
         MapRegistry.reload();
         ModEntities.register();
+        com.unrealcraft.net.RetroMapServer.init();
         ModItems.register();
         PropCommands.init();
         HalfLifeMapLoader.init();
         Quake3MapLoader.init();
+        Sm64MapLoader.init();
         LOGGER.info("Unrealcraft loaded — drop UE1 GLBs under assets/unrealcraft/models/glb/");
     }
 

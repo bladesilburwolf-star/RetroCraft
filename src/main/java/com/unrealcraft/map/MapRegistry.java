@@ -57,6 +57,8 @@ public final class MapRegistry {
             scanRoot(root);
         }
 
+        scanSm64(cfg);
+
         // Built-in asset marker if nothing named Unreal
         if (MAPS.stream().noneMatch(m -> m.id().equalsIgnoreCase("Unreal"))) {
             MAPS.add(new MapInfo("Unreal", "Unreal (built-in GLB asset)", null, null, "glb", true));
@@ -107,6 +109,33 @@ public final class MapRegistry {
         } catch (IOException e) {
             Unrealcraft.LOGGER.warn("Scan failed {}: {}", root, e.toString());
         }
+    }
+
+    /** Lists levels from a clone of n64decomp/sm64 (cfg.sm64Dir) as ids like sm64_bob_1 (level + area). */
+    private static void scanSm64(UnrealConfig cfg) {
+        if (cfg.sm64Dir == null || cfg.sm64Dir.isBlank()) return;
+        Path levels = Path.of(cfg.sm64Dir.trim()).resolve("levels");
+        if (!Files.isDirectory(levels)) {
+            Unrealcraft.LOGGER.warn("sm64Dir has no levels folder: {}", levels);
+            return;
+        }
+        int n = 0;
+        try (Stream<Path> lv = Files.list(levels)) {
+            for (Path level : (Iterable<Path>) lv.filter(Files::isDirectory)::iterator) {
+                Path areas = level.resolve("areas");
+                if (!Files.isDirectory(areas)) continue;
+                for (int a = 1; a <= 13; a++) {
+                    if (!Files.isRegularFile(areas.resolve(Integer.toString(a)).resolve("collision.inc.c"))) continue;
+                    String name = level.getFileName().toString();
+                    MAPS.add(new MapInfo("sm64_" + name + "_" + a, name + " area " + a + " (Super Mario 64)",
+                            level, null, "sm64", false));
+                    n++;
+                }
+            }
+        } catch (IOException e) {
+            Unrealcraft.LOGGER.warn("SM64 scan failed: {}", e.toString());
+        }
+        Unrealcraft.LOGGER.info("SM64 levels found: {} (from {})", n, levels);
     }
 
     private static boolean containsId(String id) {

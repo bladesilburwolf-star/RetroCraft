@@ -4,6 +4,8 @@ import com.unrealcraft.client.MapSelectScreen;
 import com.unrealcraft.client.UePropRenderer;
 import com.unrealcraft.client.halflife.HalfLifeMapRenderer;
 import com.unrealcraft.client.quake3.Quake3MapRenderer;
+import com.unrealcraft.client.retro.Sm64MobRenderer;
+import com.unrealcraft.client.retro.Sm64Collectibles;
 import com.unrealcraft.map.MapRegistry;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -21,7 +23,9 @@ public class UnrealcraftClient implements ClientModInitializer {
         EntityRendererRegistry.register(ModEntities.UE_PROP, UePropRenderer::new);
         EntityRendererRegistry.register(ModEntities.HL1_MAP, HalfLifeMapRenderer::new);
         EntityRendererRegistry.register(ModEntities.Q3_MAP, Quake3MapRenderer::new);
+        EntityRendererRegistry.register(ModEntities.SM64_MOB, Sm64MobRenderer::new);
         MapRegistry.reload();
+        com.unrealcraft.client.retro.RetroMapClient.init();
 
         openMapsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.unrealcraft.maps",
@@ -36,6 +40,7 @@ public class UnrealcraftClient implements ClientModInitializer {
                     client.setScreen(new MapSelectScreen(null));
                 }
             }
+            Sm64Collectibles.tick();
         });
     }
 }

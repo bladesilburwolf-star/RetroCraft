@@ -43,6 +43,8 @@ Blender-exported GLB is normally already in glTF's Y-up coordinate system, so th
 
 ## Quake 3 notes
 
+Q3 maps are drawn client-side (not as entities) with the lowest geometry at `mapSeaY`, X/Z origin at the player, and the player moved onto the first spawn point. Sky/nodraw surfaces are skipped. Surfaces are flat-tinted per shader until texture loading lands.
+
 PK3 files are ZIP containers. The importer extracts the selected BSP to a cache directory and imports the native BSP geometry. Polygon and mesh faces are supported; curved patch faces are intentionally left for the next geometry pass.
 
 ## T3D notes
@@ -64,3 +66,48 @@ For very large maps, increase `collisionBlockLimit` carefully. A map that exceed
 ## Assets
 
 Do not redistribute commercial Unreal, Quake, or Half-Life game data. Point the importer at game files you own.
+
+## Super Mario 64 (decomp source) levels
+
+Clone https://github.com/n64decomp/sm64, then in game:
+
+```text
+/sm64 dir "C:/path/to/sm64"
+/sm64 load bob
+/sm64 load castle_grounds 1
+/sm64 unload
+```
+
+Geometry comes from the decomp's `collision.inc.c`; no ROM is needed for this. Textures are not included in the repo and are not loaded yet.
+
+### Mario mode
+
+With an SM64 level loaded, press **M** (or run `/sm64 mario`) to play it with libsm64's movement, animation, and live Mario mesh. The mod reads the native library and ROM from `run/config/mario64/`:
+
+```text
+run/config/mario64/sm64.dll
+run/config/mario64/baserom.us.z64
+```
+
+Use a `sm64.dll` built for the libsm64 ABI used by the [Melty demo](https://github.com/Zckyy/mario64-in-minecraft), and provide your own legally obtained US ROM. Neither file is included in this repository. The SM64 level collision is passed into libsm64, so movement follows the imported level and solid props.
+
+| Key | Action |
+|-----|--------|
+| WASD | move relative to the camera |
+| Space | A: jump and jump chains |
+| Shift | Z: crouch, long jump, backflip, or ground pound depending on movement |
+| Ctrl (sprint) | B: dive |
+| Mouse | camera |
+| M | leave Mario mode |
+
+Standard GLFW gamepads are supported: the left stick moves, the right stick turns the camera, **A** jumps, **B/X** use Mario's B action, and **LB/LT/RT** crouch or ground-pound. libsm64 audio is synthesized at its 30 Hz cadence; Bob-omb Battlefield music plays on Bob-omb Battlefield.
+
+### SM64 textures
+
+Run `python3 extract_assets.py us` once in your sm64 clone (needs `baserom.us.z64`), then load a level normally. Levels whose model is fully read are drawn with their real geometry and textures; the rest fall back to the tinted collision shape. Set `"sm64Textures": false` in `run/config/unrealcraft.json` to always use the collision shape.
+
+### SM64 enemies, props and spawn eggs
+
+- Open the creative inventory, tab **Unrealcraft / SM64**: spawn eggs for Goomba, Koopa, Bob-omb, Bully, Boo, Whomp, Thwomp, Piranha Plant, Chain Chomp, Fly Guy, Lakitu, Chuckya, Amp, Mr. I, King Bob-omb and Bowser. They are placeholder boxes with no AI yet and do not despawn.
+- Loading an SM64 level also draws placeholder markers for its trees, coins, signs, doors, cannons, boxes, platforms and for its enemies at their real positions.
+- In Mario mode, walking into a coin or star marker collects it and updates the HUD (client side only for now).

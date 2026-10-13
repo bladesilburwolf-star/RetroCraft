@@ -20,6 +20,14 @@ public class UnrealConfig {
     /** Source GLB units represented by one Minecraft block. Use 50 for UE1/T3D-scale exports. */
     public float q3UnitsPerBlock = 32.0f;
     public float mapUnitsPerBlock = 50.0f;
+    /** Max distance in blocks at which imported BSP map geometry is drawn. */
+    public float retroRenderRadius = 192.0f;
+    /** Path to your clone of n64decomp/sm64 (the folder that contains levels/). Set with /sm64 dir. */
+    public String sm64Dir = "";
+    /** SM64 units per Minecraft block. Mario is ~160 units tall, so 100 makes him about 1.6 blocks. */
+    public float sm64UnitsPerBlock = 100.0f;
+    /** Draw SM64 levels with their real models and textures (needs extracted ROM assets); false = tinted collision shape. */
+    public boolean sm64Textures = true;
     /** GLB map rotation in degrees. Blender-exported GLB is normally already Y-up, so default is zero. */
     public float mapRotX = 0f;
     public float mapRotY = 0f;
@@ -53,6 +61,7 @@ public class UnrealConfig {
             }
             if (INSTANCE.mapUnitsPerBlock <= 0.001f) INSTANCE.mapUnitsPerBlock = 50f;
             if (INSTANCE.q3UnitsPerBlock <= 0.001f) INSTANCE.q3UnitsPerBlock = 32f;
+            if (INSTANCE.sm64UnitsPerBlock <= 0.001f) INSTANCE.sm64UnitsPerBlock = 100f;
             if (INSTANCE.hl1UnitsPerBlock <= 0.001f) INSTANCE.hl1UnitsPerBlock = 32f;
             if (INSTANCE.collisionBlockLimit < 1000) INSTANCE.collisionBlockLimit = 250000;
         } catch (Exception e) {

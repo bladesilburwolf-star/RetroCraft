@@ -2,10 +2,15 @@
   "mapsDir": "C:/Users/jwgreer/unrealcraft/out/ue1_maps",
   "glbDir": "C:/Users/jwgreer/unrealcraft/out/ue1_maps",
   "defaultScale": 75.0,
+  "mapSeaY": 63,
+  "q3UnitsPerBlock": 32.0,
   "mapUnitsPerBlock": 70.0,
-  "mapRotX": 0,
-  "mapRotY": 0,
-  "mapRotZ": 0,
+  "mapRotX": 0.0,
+  "mapRotY": 0.0,
+  "mapRotZ": 0.0,
   "buildCollision": true,
-  "collisionBlockLimit": 250000
+  "collisionBlockLimit": 250000,
+  "retroRenderRadius": 192.0,
+  "sm64Dir": "C:/Users/jwgreer/sm64",
+  "sm64UnitsPerBlock": 100.0
 }

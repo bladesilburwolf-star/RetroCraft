@@ -1,0 +1,897 @@
+diff --git a/MODLOG.md b/MODLOG.md
+index 54cc9fc..29b7d24 100644
+--- a/MODLOG.md
++++ b/MODLOG.md
+@@ -4,4 +4,12 @@
+ - Scaffold Fabric 1.21.1 mod `unrealcraft`
+ - GLB prop entity + `/ue spawn` from Minewind-style loader
+ - Toolkit: `tools/ue1_to_glb.py`, `tools/ue1_pipeline.md` (UModel → GLB)
+-\n## Unified importer patch — 2026-10-07\n- Separated world-map GLB transforms from item/prop transforms.\n- Removed automatic 45-degree item diagonal and longest-axis normalization from world GLBs.\n- Added map-unit scaling, X/Z centering, sea-level grounding, and surface collision voxelization.\n- Added direct T3D `_mesh.json` map loading.\n- Merged GoldSrc/HL1 BSP v30 + WAD3 import into Unrealcraft.\n- Added Quake 3 BSP v46 and PK3-container loading.\n
+\ No newline at end of file
++\n## Unified importer patch — 2026-10-07\n- Separated world-map GLB transforms from item/prop transforms.\n- Removed automatic 45-degree item diagonal and longest-axis normalization from world GLBs.\n- Added map-unit scaling, X/Z centering, sea-level grounding, and surface collision voxelization.\n- Added direct T3D `_mesh.json` map loading.\n- Merged GoldSrc/HL1 BSP v30 + WAD3 import into Unrealcraft.\n- Added Quake 3 BSP v46 and PK3-container loading.\n
++
++## Q3 visibility fix - 2026-10-07
++- Q3 maps are drawn client-side (WorldRenderEvents.AFTER_ENTITIES) from a `retro_map` payload instead of a tracked entity. Old entity path was culled whenever the map's Y section was outside render distance (map at mapSeaY, player elsewhere) and untracked past server view distance.
++- Q3 placement: X/Z origin = player block, lowest drawable point = mapSeaY, player moved onto the spawn floor (info_player_start / first deathmatch spawn).
++- Sky, nodraw, hint, skip and common/clip surfaces are dropped from both render and collision.
++- Collision now voxelizes exactly the rendered triangles with the same placement; barriers sit below the visible floor.
++- New config: `retroRenderRadius` (blocks, default 192).
++
+diff --git a/README.md b/README.md
+index acdbf80..45bb01d 100644
+--- a/README.md
++++ b/README.md
+@@ -43,6 +43,8 @@ Blender-exported GLB is normally already in glTF's Y-up coordinate system, so th
+ 
+ ## Quake 3 notes
+ 
++Q3 maps are drawn client-side (not as entities) with the lowest geometry at `mapSeaY`, X/Z origin at the player, and the player moved onto the first spawn point. Sky/nodraw surfaces are skipped. Surfaces are flat-tinted per shader until texture loading lands.
++
+ PK3 files are ZIP containers. The importer extracts the selected BSP to a cache directory and imports the native BSP geometry. Polygon and mesh faces are supported; curved patch faces are intentionally left for the next geometry pass.
+ 
+ ## T3D notes
+diff --git a/src/main/java/com/unrealcraft/Quake3MapLoader.java b/src/main/java/com/unrealcraft/Quake3MapLoader.java
+index 817b961..0645b03 100644
+--- a/src/main/java/com/unrealcraft/Quake3MapLoader.java
++++ b/src/main/java/com/unrealcraft/Quake3MapLoader.java
+@@ -2,12 +2,16 @@ package com.unrealcraft;
+ 
+ import com.mojang.brigadier.arguments.StringArgumentType;
+ import com.unrealcraft.config.UnrealConfig;
+-import com.unrealcraft.entity.Quake3MapEntity;
++import com.unrealcraft.net.RetroMapPayload;
++import com.unrealcraft.net.RetroMapServer;
++import com.unrealcraft.quake3.Quake3Bsp;
+ import com.unrealcraft.quake3.Quake3Collision;
+ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
++import net.minecraft.block.Block;
+ import net.minecraft.block.Blocks;
+ import net.minecraft.server.command.CommandManager;
+ import net.minecraft.server.command.ServerCommandSource;
++import net.minecraft.server.network.ServerPlayerEntity;
+ import net.minecraft.server.world.ServerWorld;
+ import net.minecraft.text.Text;
+ import net.minecraft.util.math.BlockPos;
+@@ -19,11 +23,12 @@ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ 
+ /**
+- * Load Quake 3 .pk3 / loose .bsp around the player at sea level (Minewind-style).
++ * Load Quake 3 .pk3 / loose .bsp. The map is drawn client-side (see RetroMapClient) from a payload,
++ * so it no longer depends on entity tracking range, section culling or the player's height.
++ * Placement: map X/Z origin = player's block, lowest drawable point at mapSeaY, player is moved onto the spawn floor.
+  */
+ public final class Quake3MapLoader {
+     private static final List<BlockPos> COLLISION = new ArrayList<>();
+-    private static int entityId = -1;
+ 
+     private Quake3MapLoader() {}
+ 
+@@ -37,7 +42,10 @@ public final class Quake3MapLoader {
+                                     .executes(c -> load(c.getSource(),
+                                             StringArgumentType.getString(c, "pk3"),
+                                             StringArgumentType.getString(c, "map"))))));
+-            root.then(CommandManager.literal("unload").executes(c -> unload(c.getSource())));
++            root.then(CommandManager.literal("unload").executes(c -> {
++                clear(c.getSource().getWorld());
++                return 1;
++            }));
+             dispatcher.register(root);
+         });
+     }
+@@ -47,42 +55,61 @@ public final class Quake3MapLoader {
+     }
+ 
+     public static int load(ServerCommandSource src, String pk3, String wanted) {
+-        unload(src);
++        ServerWorld w = src.getWorld();
++        clear(w);
+         Path p = Path.of(pk3);
+         if (!Files.isRegularFile(p)) {
+             src.sendError(Text.literal("PK3/BSP not found: " + p));
+             return 0;
+         }
+         try {
+-            Path bsp = p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".bsp")
++            Path bspPath = p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".bsp")
+                     ? p : extractBsp(p, wanted);
+-            if (bsp == null) {
++            if (bspPath == null) {
+                 src.sendError(Text.literal("No BSP found in PK3"));
+                 return 0;
+             }
+-            ServerWorld w = src.getWorld();
+-            var pos = src.getPosition();
+-            int sea = UnrealConfig.get().mapSeaY;
+-            double ax = Math.floor(pos.x) + 0.5;
+-            double az = Math.floor(pos.z) + 0.5;
++            UnrealConfig cfg = UnrealConfig.get();
++            Quake3Bsp bsp = Quake3Bsp.load(bspPath);
++            var tris = bsp.triangles();
++            if (tris.isEmpty()) {
++                src.sendError(Text.literal("Q3 BSP has no drawable geometry (" + bspPath.getFileName() + ")"));
++                return 0;
++            }
++            var pl = bsp.placement(tris, cfg.q3UnitsPerBlock);
+ 
+-            Quake3MapEntity e = new Quake3MapEntity(w, bsp.toAbsolutePath().toString());
+-            e.refreshPositionAndAngles(ax, sea, az, 0, 0);
+-            w.spawnEntity(e);
+-            entityId = e.getId();
++            var pos = src.getPosition();
++            int sea = cfg.mapSeaY;
++            int ax = (int) Math.floor(pos.x), az = (int) Math.floor(pos.z);
++            BlockPos origin = new BlockPos(ax, sea, az);
+ 
+-            if (UnrealConfig.get().buildCollision) {
+-                BlockPos origin = new BlockPos((int) Math.floor(pos.x), sea, (int) Math.floor(pos.z));
+-                for (BlockPos bp : Quake3Collision.build(bsp, origin)) {
+-                    w.setBlockState(bp, Blocks.BARRIER.getDefaultState());
++            int placed = 0;
++            if (cfg.buildCollision) {
++                // NOTIFY_LISTENERS only: skip neighbour updates, which is what makes bulk barrier placement slow
++                for (int[] v : Quake3Collision.voxels(tris, pl, cfg.collisionBlockLimit)) {
++                    BlockPos bp = origin.add(v[0], v[1], v[2]);
++                    if (w.isOutOfHeightLimit(bp)) continue;
++                    w.setBlockState(bp, Blocks.BARRIER.getDefaultState(), Block.NOTIFY_LISTENERS);
+                     COLLISION.add(bp);
++                    placed++;
+                 }
+             }
+ 
+-            final String name = bsp.getFileName().toString();
+-            src.sendFeedback(() -> Text.literal(
+-                    "Quake 3 map §e" + name + "§r at sea level ("
+-                            + (int) ax + ", " + sea + ", " + (int) az + ")"), false);
++            String abs = bspPath.toAbsolutePath().toString();
++            RetroMapServer.show(w.getServer(), new RetroMapPayload("load", "q3", abs, ax, sea, az));
++
++            ServerPlayerEntity player = src.getPlayer();
++            if (player != null && pl.hasSpawn()) {
++                player.requestTeleport(ax + 0.5, sea + pl.spawnFeetLocalY() + 0.05, az + 0.5);
++            }
++
++            final String name = bspPath.getFileName().toString();
++            final int fPlaced = placed;
++            src.sendFeedback(() -> Text.literal(String.format(
++                    "Quake 3 map §e%s§r: %d tris, anchor (%d, %d, %d), %d collision blocks%s",
++                    name, tris.size(), ax, sea, az, fPlaced,
++                    pl.hasSpawn() ? ", moved to spawn" : ", no spawn point (centred)")), false);
++            Unrealcraft.LOGGER.info("Q3 loaded {} tris={} anchor=({},{},{}) placement={}", name, tris.size(), ax, sea, az, pl);
+             return 1;
+         } catch (Exception e) {
+             Unrealcraft.LOGGER.error("Q3 load failed", e);
+@@ -129,18 +156,12 @@ public final class Quake3MapLoader {
+         }
+     }
+ 
+-    private static int unload(ServerCommandSource src) {
+-        ServerWorld w = src.getWorld();
+-        if (entityId >= 0) {
+-            var e = w.getEntityById(entityId);
+-            if (e != null) e.discard();
+-            entityId = -1;
+-        }
++    /** Remove the client-side render and the barrier collision of the active Q3 map. */
++    public static void clear(ServerWorld w) {
++        RetroMapServer.hide(w.getServer(), "q3");
+         for (BlockPos p : COLLISION) {
+-            w.setBlockState(p, Blocks.AIR.getDefaultState());
++            w.setBlockState(p, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
+         }
+-        int n = COLLISION.size();
+         COLLISION.clear();
+-        return n;
+     }
+ }
+diff --git a/src/main/java/com/unrealcraft/Unrealcraft.java b/src/main/java/com/unrealcraft/Unrealcraft.java
+index c0d7022..33a5fe9 100644
+--- a/src/main/java/com/unrealcraft/Unrealcraft.java
++++ b/src/main/java/com/unrealcraft/Unrealcraft.java
+@@ -16,6 +16,7 @@ public class Unrealcraft implements ModInitializer {
+         UnrealConfig.load();
+         MapRegistry.reload();
+         ModEntities.register();
++        com.unrealcraft.net.RetroMapServer.init();
+         ModItems.register();
+         PropCommands.init();
+         HalfLifeMapLoader.init();
+diff --git a/src/main/java/com/unrealcraft/UnrealcraftClient.java b/src/main/java/com/unrealcraft/UnrealcraftClient.java
+index eb31891..33db9ee 100644
+--- a/src/main/java/com/unrealcraft/UnrealcraftClient.java
++++ b/src/main/java/com/unrealcraft/UnrealcraftClient.java
+@@ -22,6 +22,7 @@ public class UnrealcraftClient implements ClientModInitializer {
+         EntityRendererRegistry.register(ModEntities.HL1_MAP, HalfLifeMapRenderer::new);
+         EntityRendererRegistry.register(ModEntities.Q3_MAP, Quake3MapRenderer::new);
+         MapRegistry.reload();
++        com.unrealcraft.client.retro.RetroMapClient.init();
+ 
+         openMapsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                 "key.unrealcraft.maps",
+diff --git a/src/main/java/com/unrealcraft/client/quake3/Quake3MapMesh.java b/src/main/java/com/unrealcraft/client/quake3/Quake3MapMesh.java
+index 1ab11db..9dfe812 100644
+--- a/src/main/java/com/unrealcraft/client/quake3/Quake3MapMesh.java
++++ b/src/main/java/com/unrealcraft/client/quake3/Quake3MapMesh.java
+@@ -1,21 +1,76 @@
+ package com.unrealcraft.client.quake3;
+ 
+ import com.unrealcraft.quake3.Quake3Bsp;
++
+ import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
++/**
++ * CPU-side render mesh for a Q3 map (pure Java). Positions are in blocks relative to the map anchor
++ * (local = (raw - ref) / unitsPerBlock) and bucketed into 16-block cells so the renderer can cull by distance.
++ */
+ public final class Quake3MapMesh {
+-    public record Tri(String texture,float[] pos,float[] uv){}
+-    public final List<Tri> tris;
+-    private Quake3MapMesh(List<Tri> t){tris=t;}
+-    public static Quake3MapMesh build(Quake3Bsp bsp,float unitsPerBlock){
+-        List<Quake3Bsp.Tri> raw=bsp.triangles(); List<Tri> out=new ArrayList<>();
+-        if(raw.isEmpty())return new Quake3MapMesh(out);
+-        float minX=Float.MAX_VALUE,minY=Float.MAX_VALUE,minZ=Float.MAX_VALUE,maxX=-Float.MAX_VALUE,maxY=-Float.MAX_VALUE,maxZ=-Float.MAX_VALUE;
+-        for(var t:raw)for(int i=0;i<t.xyz().length;i+=3){minX=Math.min(minX,t.xyz()[i]);maxX=Math.max(maxX,t.xyz()[i]);minY=Math.min(minY,t.xyz()[i+1]);maxY=Math.max(maxY,t.xyz()[i+1]);minZ=Math.min(minZ,t.xyz()[i+2]);maxZ=Math.max(maxZ,t.xyz()[i+2]);}
+-        float cx=(minX+maxX)*.5f,cz=(minZ+maxZ)*.5f,fy=minY,s=Math.max(unitsPerBlock,.001f);
+-        for(var t:raw){float[] p=t.xyz().clone();for(int i=0;i<p.length;i+=3){p[i]=(p[i]-cx)/s;p[i+1]=(p[i+1]-fy)/s;p[i+2]=(p[i+2]-cz)/s;}out.add(new Tri(t.texture(),p,t.uv()));}
+-        return new Quake3MapMesh(out);
++    public static final int CELL = 16;
++
++    public record Tri(float[] pos, float[] uv, float[] nrm, int r, int g, int b) {}
++
++    public static final class Cell {
++        public final List<Tri> tris = new ArrayList<>();
++        public float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, minZ = Float.MAX_VALUE;
++        public float maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE, maxZ = -Float.MAX_VALUE;
++
++        /** Squared distance from a point to this cell's bounding box. */
++        public double distSq(double x, double y, double z) {
++            double dx = Math.max(Math.max(minX - x, 0), x - maxX);
++            double dy = Math.max(Math.max(minY - y, 0), y - maxY);
++            double dz = Math.max(Math.max(minZ - z, 0), z - maxZ);
++            return dx * dx + dy * dy + dz * dz;
++        }
++    }
++
++    public final Quake3Bsp.Placement placement;
++    public final List<Cell> cells;
++    public final int triCount;
++
++    private Quake3MapMesh(Quake3Bsp.Placement pl, List<Cell> cells, int n) {
++        this.placement = pl; this.cells = cells; this.triCount = n;
++    }
++
++    public static Quake3MapMesh build(Quake3Bsp bsp, float unitsPerBlock) {
++        List<Quake3Bsp.Tri> raw = bsp.triangles();
++        return build(bsp, raw, bsp.placement(raw, unitsPerBlock));
++    }
++
++    public static Quake3MapMesh build(Quake3Bsp bsp, List<Quake3Bsp.Tri> raw, Quake3Bsp.Placement pl) {
++        Map<Long, Cell> map = new LinkedHashMap<>();
++        for (Quake3Bsp.Tri t : raw) {
++            float[] p = new float[9];
++            for (int i = 0; i < 9; i += 3) {
++                p[i] = pl.lx(t.xyz()[i]); p[i + 1] = pl.ly(t.xyz()[i + 1]); p[i + 2] = pl.lz(t.xyz()[i + 2]);
++            }
++            int rgb = tint(t.texture());
++            Tri tri = new Tri(p, t.uv(), t.nrm(), (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
++            float cx = (p[0] + p[3] + p[6]) / 3f, cy = (p[1] + p[4] + p[7]) / 3f, cz = (p[2] + p[5] + p[8]) / 3f;
++            long key = ((long) Math.floorDiv((int) Math.floor(cx), CELL) & 0xFFFFF) << 40
++                    | ((long) Math.floorDiv((int) Math.floor(cy), CELL) & 0xFFFFF) << 20
++                    | ((long) Math.floorDiv((int) Math.floor(cz), CELL) & 0xFFFFF);
++            Cell c = map.computeIfAbsent(key, k -> new Cell());
++            c.tris.add(tri);
++            for (int i = 0; i < 9; i += 3) {
++                c.minX = Math.min(c.minX, p[i]); c.maxX = Math.max(c.maxX, p[i]);
++                c.minY = Math.min(c.minY, p[i + 1]); c.maxY = Math.max(c.maxY, p[i + 1]);
++                c.minZ = Math.min(c.minZ, p[i + 2]); c.maxZ = Math.max(c.maxZ, p[i + 2]);
++            }
++        }
++        return new Quake3MapMesh(pl, new ArrayList<>(map.values()), raw.size());
++    }
++
++    /** Stable pastel tint per shader name so surfaces are distinguishable until real textures are wired in. */
++    private static int tint(String shader) {
++        int h = shader.hashCode() * 0x9E3779B1;
++        int r = 150 + ((h >>> 16) & 0x6F), g = 150 + ((h >>> 8) & 0x6F), b = 150 + (h & 0x6F);
++        return (Math.min(r, 255) << 16) | (Math.min(g, 255) << 8) | Math.min(b, 255);
+     }
+-    public java.util.Map<String,List<Tri>> byTexture(){java.util.Map<String,List<Tri>>r=new java.util.LinkedHashMap<>();for(Tri t:tris)r.computeIfAbsent(t.texture(),k->new ArrayList<>()).add(t);return r;}
+ }
+diff --git a/src/main/java/com/unrealcraft/client/quake3/Quake3MapRenderer.java b/src/main/java/com/unrealcraft/client/quake3/Quake3MapRenderer.java
+index 351fa3f..b88a3eb 100644
+--- a/src/main/java/com/unrealcraft/client/quake3/Quake3MapRenderer.java
++++ b/src/main/java/com/unrealcraft/client/quake3/Quake3MapRenderer.java
+@@ -1,82 +1,23 @@
+ package com.unrealcraft.client.quake3;
+ 
+-import com.unrealcraft.Unrealcraft;
+-import com.unrealcraft.config.UnrealConfig;
+ import com.unrealcraft.entity.Quake3MapEntity;
+-import com.unrealcraft.quake3.Quake3Bsp;
+-import net.minecraft.client.render.OverlayTexture;
+-import net.minecraft.client.render.RenderLayer;
+-import net.minecraft.client.render.VertexConsumer;
++import net.minecraft.client.render.Frustum;
+ import net.minecraft.client.render.VertexConsumerProvider;
+ import net.minecraft.client.render.entity.EntityRenderer;
+ import net.minecraft.client.render.entity.EntityRendererFactory;
+-import net.minecraft.client.render.Frustum;
+ import net.minecraft.client.util.math.MatrixStack;
+ import net.minecraft.util.Identifier;
+ 
+-import java.nio.file.Path;
+-import java.util.HashMap;
+-import java.util.Map;
+-
++/** Legacy entity from older saves. Q3 maps are now drawn by RetroMapClient; this renders nothing. */
+ public final class Quake3MapRenderer extends EntityRenderer<Quake3MapEntity> {
+-    private final Map<String, Quake3MapMesh> cache = new HashMap<>();
+-
+-    public Quake3MapRenderer(EntityRendererFactory.Context c) {
+-        super(c);
+-        shadowRadius = 0;
+-    }
+-
+-    private Quake3MapMesh mesh(String path) {
+-        if (path == null || path.isBlank()) return null;
+-        if (cache.containsKey(path)) return cache.get(path);
+-        try {
+-            float upb = UnrealConfig.get().q3UnitsPerBlock;
+-            if (upb <= 0.001f) upb = 32f;
+-            Quake3Bsp b = Quake3Bsp.load(Path.of(path));
+-            Quake3MapMesh m = Quake3MapMesh.build(b, upb);
+-            cache.put(path, m);
+-            Unrealcraft.LOGGER.info("Q3 mesh {}: {} triangles (upb={})", path, m.tris.size(), upb);
+-            return m;
+-        } catch (Exception e) {
+-            Unrealcraft.LOGGER.error("Q3 BSP failed {}", path, e);
+-            cache.put(path, null);
+-            return null;
+-        }
+-    }
++    public Quake3MapRenderer(EntityRendererFactory.Context c) { super(c); shadowRadius = 0; }
+ 
+     @Override
+-    public boolean shouldRender(Quake3MapEntity e, Frustum f, double x, double y, double z) {
+-        return true;
+-    }
++    public boolean shouldRender(Quake3MapEntity e, Frustum f, double x, double y, double z) { return false; }
+ 
+     @Override
+-    public void render(Quake3MapEntity e, float yaw, float tick, MatrixStack ms,
+-                       VertexConsumerProvider consumers, int light) {
+-        Quake3MapMesh m = mesh(e.getBspPath());
+-        if (m == null || m.tris.isEmpty()) return;
+-        // MatrixStack is already translated to entity position by the dispatcher
+-        ms.push();
+-        Identifier tex = Identifier.ofVanilla("textures/block/stone.png");
+-        for (var entry : m.byTexture().entrySet()) {
+-            VertexConsumer vc = consumers.getBuffer(RenderLayer.getEntityCutoutNoCull(tex));
+-            var en = ms.peek();
+-            for (var t : entry.getValue()) {
+-                for (int i = 0; i < 3; i++) {
+-                    int p = i * 3, u = i * 2;
+-                    vc.vertex(en, t.pos()[p], t.pos()[p + 1], t.pos()[p + 2])
+-                            .color(255, 255, 255, 255)
+-                            .texture(t.uv()[u], 1f - t.uv()[u + 1])
+-                            .overlay(OverlayTexture.DEFAULT_UV)
+-                            .light(0xF000F0)
+-                            .normal(en, 0, 1, 0);
+-                }
+-            }
+-        }
+-        ms.pop();
+-    }
++    public void render(Quake3MapEntity e, float yaw, float tick, MatrixStack ms, VertexConsumerProvider vcp, int light) {}
+ 
+     @Override
+-    public Identifier getTexture(Quake3MapEntity e) {
+-        return Identifier.ofVanilla("textures/block/stone.png");
+-    }
++    public Identifier getTexture(Quake3MapEntity e) { return Identifier.ofVanilla("textures/block/stone.png"); }
+ }
+diff --git a/src/main/java/com/unrealcraft/client/retro/RetroMapClient.java b/src/main/java/com/unrealcraft/client/retro/RetroMapClient.java
+new file mode 100644
+index 0000000..2a20a7a
+--- /dev/null
++++ b/src/main/java/com/unrealcraft/client/retro/RetroMapClient.java
+@@ -0,0 +1,98 @@
++package com.unrealcraft.client.retro;
++
++import com.unrealcraft.Unrealcraft;
++import com.unrealcraft.client.quake3.Quake3MapMesh;
++import com.unrealcraft.config.UnrealConfig;
++import com.unrealcraft.net.RetroMapPayload;
++import com.unrealcraft.quake3.Quake3Bsp;
++import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
++import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
++import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
++import net.minecraft.client.render.OverlayTexture;
++import net.minecraft.client.render.RenderLayer;
++import net.minecraft.client.render.VertexConsumer;
++import net.minecraft.client.render.VertexConsumerProvider;
++import net.minecraft.client.util.math.MatrixStack;
++import net.minecraft.util.Identifier;
++import net.minecraft.util.math.Vec3d;
++
++import java.nio.file.Path;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * Draws imported maps straight from the world-render pipeline. Not an entity, so it is immune to
++ * entity tracking range, "is this section rendered" culling and server view distance.
++ */
++public final class RetroMapClient {
++    private static final Identifier TEX = Identifier.ofVanilla("textures/block/stone.png");
++
++    private static final class Active {
++        final String kind, path; final double x, y, z;
++        Quake3MapMesh q3; boolean failed;
++        Active(RetroMapPayload p) { kind = p.kind(); path = p.path(); x = p.x(); y = p.y(); z = p.z(); }
++    }
++
++    private static final Map<String, Active> ACTIVE = new LinkedHashMap<>();
++
++    private RetroMapClient() {}
++
++    public static void init() {
++        ClientPlayNetworking.registerGlobalReceiver(RetroMapPayload.ID, (payload, ctx) -> ctx.client().execute(() -> {
++            if ("clear".equals(payload.action())) ACTIVE.remove(payload.kind());
++            else ACTIVE.put(payload.kind(), new Active(payload));
++        }));
++        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> ACTIVE.clear());
++        WorldRenderEvents.AFTER_ENTITIES.register(ctx -> {
++            if (ACTIVE.isEmpty()) return;
++            VertexConsumerProvider vcp = ctx.consumers();
++            MatrixStack ms = ctx.matrixStack();
++            if (vcp == null || ms == null) return;
++            Vec3d cam = ctx.camera().getPos();
++            for (Active a : ACTIVE.values()) draw(a, ms, vcp, cam);
++        });
++    }
++
++    private static void draw(Active a, MatrixStack ms, VertexConsumerProvider vcp, Vec3d cam) {
++        if (a.failed) return;
++        if ("q3".equals(a.kind)) {
++            if (a.q3 == null) {
++                try {
++                    Quake3Bsp bsp = Quake3Bsp.load(Path.of(a.path));
++                    a.q3 = Quake3MapMesh.build(bsp, UnrealConfig.get().q3UnitsPerBlock);
++                    Unrealcraft.LOGGER.info("Q3 mesh {}: {} triangles, {} cells, anchor ({}, {}, {})",
++                            a.path, a.q3.triCount, a.q3.cells.size(), a.x, a.y, a.z);
++                } catch (Exception e) {
++                    Unrealcraft.LOGGER.error("Q3 mesh failed for {}", a.path, e);
++                    a.failed = true;
++                    return;
++                }
++            }
++            drawQ3(a, a.q3, ms, vcp, cam);
++        }
++    }
++
++    private static void drawQ3(Active a, Quake3MapMesh mesh, MatrixStack ms, VertexConsumerProvider vcp, Vec3d cam) {
++        double lx = cam.x - a.x, ly = cam.y - a.y, lz = cam.z - a.z;
++        double r = Math.max(32, UnrealConfig.get().retroRenderRadius), r2 = r * r;
++        VertexConsumer vc = vcp.getBuffer(RenderLayer.getEntityCutoutNoCull(TEX));
++        ms.push();
++        ms.translate(a.x - cam.x, a.y - cam.y, a.z - cam.z);
++        MatrixStack.Entry en = ms.peek();
++        for (Quake3MapMesh.Cell c : mesh.cells) {
++            if (c.distSq(lx, ly, lz) > r2) continue;
++            for (Quake3MapMesh.Tri t : c.tris) {
++                for (int i = 0; i < 3; i++) {
++                    int p = i * 3, u = i * 2;
++                    vc.vertex(en, t.pos()[p], t.pos()[p + 1], t.pos()[p + 2])
++                            .color(t.r(), t.g(), t.b(), 255)
++                            .texture(t.uv()[u], 1f - t.uv()[u + 1])
++                            .overlay(OverlayTexture.DEFAULT_UV)
++                            .light(0xF000F0)
++                            .normal(en, t.nrm()[0], t.nrm()[1], t.nrm()[2]);
++                }
++            }
++        }
++        ms.pop();
++    }
++}
+diff --git a/src/main/java/com/unrealcraft/config/UnrealConfig.java b/src/main/java/com/unrealcraft/config/UnrealConfig.java
+index 2676888..2978160 100644
+--- a/src/main/java/com/unrealcraft/config/UnrealConfig.java
++++ b/src/main/java/com/unrealcraft/config/UnrealConfig.java
+@@ -20,6 +20,8 @@ public class UnrealConfig {
+     /** Source GLB units represented by one Minecraft block. Use 50 for UE1/T3D-scale exports. */
+     public float q3UnitsPerBlock = 32.0f;
+     public float mapUnitsPerBlock = 50.0f;
++    /** Max distance in blocks at which imported BSP map geometry is drawn. */
++    public float retroRenderRadius = 192.0f;
+     /** GLB map rotation in degrees. Blender-exported GLB is normally already Y-up, so default is zero. */
+     public float mapRotX = 0f;
+     public float mapRotY = 0f;
+diff --git a/src/main/java/com/unrealcraft/entity/Quake3MapEntity.java b/src/main/java/com/unrealcraft/entity/Quake3MapEntity.java
+index 26a42c5..bd57e21 100644
+--- a/src/main/java/com/unrealcraft/entity/Quake3MapEntity.java
++++ b/src/main/java/com/unrealcraft/entity/Quake3MapEntity.java
+@@ -46,6 +46,13 @@ public class Quake3MapEntity extends Entity {
+         n.putString("BspPath", getBspPath());
+     }
+ 
++    @Override
++    public void tick() {
++        super.tick();
++        // legacy entity from older saves; maps are now drawn client-side
++        if (!getWorld().isClient) discard();
++    }
++
+     @Override
+     public boolean shouldRender(double distance) {
+         return distance < 512.0 * 512.0;
+diff --git a/src/main/java/com/unrealcraft/map/MapLoader.java b/src/main/java/com/unrealcraft/map/MapLoader.java
+index 7897aea..1bc323b 100644
+--- a/src/main/java/com/unrealcraft/map/MapLoader.java
++++ b/src/main/java/com/unrealcraft/map/MapLoader.java
+@@ -33,6 +33,7 @@ public final class MapLoader {
+     private MapLoader() {}
+ 
+     public static void clear(ServerWorld world) {
++        Quake3MapLoader.clear(world);
+         for (UUID id : new ArrayList<>(LOADED)) {
+             var e = world.getEntity(id);
+             if (e != null) e.discard();
+diff --git a/src/main/java/com/unrealcraft/net/RetroMapPayload.java b/src/main/java/com/unrealcraft/net/RetroMapPayload.java
+new file mode 100644
+index 0000000..b33e873
+--- /dev/null
++++ b/src/main/java/com/unrealcraft/net/RetroMapPayload.java
+@@ -0,0 +1,28 @@
++package com.unrealcraft.net;
++
++import com.unrealcraft.Unrealcraft;
++import net.minecraft.network.RegistryByteBuf;
++import net.minecraft.network.codec.PacketCodec;
++import net.minecraft.network.codec.PacketCodecs;
++import net.minecraft.network.packet.CustomPayload;
++
++/**
++ * Server -> client: draw (or clear) an imported map at a world anchor.
++ * action = "load" | "clear", kind = "q3" (hl1 / t3d to follow), path = absolute file path readable by the client.
++ */
++public record RetroMapPayload(String action, String kind, String path, double x, double y, double z)
++        implements CustomPayload {
++    public static final Id<RetroMapPayload> ID = new Id<>(Unrealcraft.id("retro_map"));
++    public static final PacketCodec<RegistryByteBuf, RetroMapPayload> CODEC = PacketCodec.tuple(
++            PacketCodecs.STRING, RetroMapPayload::action,
++            PacketCodecs.STRING, RetroMapPayload::kind,
++            PacketCodecs.STRING, RetroMapPayload::path,
++            PacketCodecs.DOUBLE, RetroMapPayload::x,
++            PacketCodecs.DOUBLE, RetroMapPayload::y,
++            PacketCodecs.DOUBLE, RetroMapPayload::z,
++            RetroMapPayload::new);
++
++    public static RetroMapPayload clear(String kind) { return new RetroMapPayload("clear", kind, "", 0, 0, 0); }
++
++    @Override public Id<? extends CustomPayload> getId() { return ID; }
++}
+diff --git a/src/main/java/com/unrealcraft/net/RetroMapServer.java b/src/main/java/com/unrealcraft/net/RetroMapServer.java
+new file mode 100644
+index 0000000..16f146c
+--- /dev/null
++++ b/src/main/java/com/unrealcraft/net/RetroMapServer.java
+@@ -0,0 +1,37 @@
++package com.unrealcraft.net;
++
++import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
++import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
++import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.network.ServerPlayerEntity;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/** Tracks which imported maps are active and keeps every client's renderer in sync (including late joiners). */
++public final class RetroMapServer {
++    private static final Map<String, RetroMapPayload> ACTIVE = new LinkedHashMap<>();
++
++    private RetroMapServer() {}
++
++    public static void init() {
++        PayloadTypeRegistry.playS2C().register(RetroMapPayload.ID, RetroMapPayload.CODEC);
++        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
++            for (RetroMapPayload p : ACTIVE.values()) ServerPlayNetworking.send(handler.player, p);
++        });
++        ServerLifecycleEvents.SERVER_STOPPING.register(server -> ACTIVE.clear());
++    }
++
++    public static void show(MinecraftServer server, RetroMapPayload load) {
++        ACTIVE.put(load.kind(), load);
++        for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) ServerPlayNetworking.send(p, load);
++    }
++
++    public static void hide(MinecraftServer server, String kind) {
++        ACTIVE.remove(kind);
++        RetroMapPayload c = RetroMapPayload.clear(kind);
++        for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) ServerPlayNetworking.send(p, c);
++    }
++}
+diff --git a/src/main/java/com/unrealcraft/quake3/Quake3Bsp.java b/src/main/java/com/unrealcraft/quake3/Quake3Bsp.java
+index 5114917..e4da0e0 100644
+--- a/src/main/java/com/unrealcraft/quake3/Quake3Bsp.java
++++ b/src/main/java/com/unrealcraft/quake3/Quake3Bsp.java
+@@ -1,6 +1,5 @@
+ package com.unrealcraft.quake3;
+ 
+-import com.unrealcraft.Unrealcraft;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+@@ -9,19 +8,46 @@ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+-/** Quake 3 BSP v46 reader. Renders polygon/mesh faces; patch surfaces are skipped for now. */
++/**
++ * Quake 3 BSP v46 reader (pure Java, no Minecraft types).
++ * Output coordinates are already converted from Q3 (X right, Y forward, Z up) to Minecraft axes
++ * (x, y=up, z=-forward). Sky / nodraw / clip-type surfaces are dropped; patch faces are tessellated.
++ */
+ public final class Quake3Bsp {
+     public record Vertex(float x,float y,float z,float nx,float ny,float nz,float u,float v) {}
+     public record Face(int texture,int type,int vertex,int vertexCount,int meshVert,int meshVertCount,int patchWidth,int patchHeight) {}
+     public record Shader(String name,int flags,int contents) {}
+-    public record Tri(String texture,float[] xyz,float[] uv) {}
++    /** xyz = 3 verts in Minecraft axes (raw Q3 units); nrm = unit face normal (Minecraft axes). */
++    public record Tri(String texture,float[] xyz,float[] uv,float[] nrm) {}
++
++    /**
++     * Maps raw Q3 units to blocks: local = (p - ref) / scale.
++     * ref.y is the lowest drawable point, ref.xz is the spawn point (or the map centre when no spawn exists).
++     * spawnFeetLocalY is the floor height under the spawn in local blocks (NaN when there is no spawn).
++     */
++    public record Placement(float refX,float refY,float refZ,float scale,float spawnFeetLocalY) {
++        public boolean hasSpawn() { return !Float.isNaN(spawnFeetLocalY); }
++        public float lx(float x){ return (x-refX)/scale; }
++        public float ly(float y){ return (y-refY)/scale; }
++        public float lz(float z){ return (z-refZ)/scale; }
++    }
++
++    private static final int SURF_SKY=0x4, SURF_NODRAW=0x80, SURF_HINT=0x100, SURF_SKIP=0x200;
++    private static final Pattern HIDDEN_SHADER=Pattern.compile(
++            "^textures/common/(clip|weapclip|missileclip|botclip|nodraw|nodrawnonsolid|caulk|caulknodrop|hint|skip|trigger|cluster|areaportal|origin|invisible|fog.*)$");
++    private static final Pattern ENTITY_BLOCK=Pattern.compile("\\{([^}]*)}");
++    private static final Pattern KV=Pattern.compile("\"([^\"]+)\"\\s+\"([^\"]*)\"");
++
+     private final List<Vertex> vertices;
+     private final List<Integer> meshVerts;
+     private final List<Face> faces;
+     private final List<Shader> shaders;
++    private final String entities;
+ 
+-    private Quake3Bsp(List<Vertex> v,List<Integer> mv,List<Face> f,List<Shader> s){vertices=v;meshVerts=mv;faces=f;shaders=s;}
++    private Quake3Bsp(List<Vertex> v,List<Integer> mv,List<Face> f,List<Shader> s,String ents){vertices=v;meshVerts=mv;faces=f;shaders=s;entities=ents;}
+ 
+     public static Quake3Bsp load(Path p) throws IOException {
+         byte[] d=Files.readAllBytes(p);
+@@ -32,6 +58,7 @@ public final class Quake3Bsp {
+         int version=b.getInt();if(version!=46)throw new IOException("Unsupported Q3 BSP version "+version);
+         int[] off=new int[17],len=new int[17];
+         for(int i=0;i<17;i++){off[i]=b.getInt();len[i]=b.getInt();if(off[i]<0||len[i]<0||(long)off[i]+len[i]>d.length)throw new IOException("Invalid BSP lump "+i);}
++        String ents=new String(d,off[0],len[0],StandardCharsets.ISO_8859_1);
+         List<Shader> shaders=readShaders(d,off[1],len[1]);
+         List<Vertex> verts=new ArrayList<>(len[10]/44);ByteBuffer vb=slice(d,off[10],len[10]);
+         while(vb.remaining()>=44){
+@@ -42,25 +69,62 @@ public final class Quake3Bsp {
+             vb.getInt(); // vertex colour
+             verts.add(new Vertex(x,y,z,nx,ny,nz,u,v));
+         }
+-        return new Quake3Bsp(verts,readInts(d,off[11],len[11]),readFaces(d,off[13],len[13]),shaders);
++        return new Quake3Bsp(verts,readInts(d,off[11],len[11]),readFaces(d,off[13],len[13]),shaders,ents);
++    }
++
++    /** First player spawn in raw Q3 coordinates {x,y,z(up),angle}, or null. info_player_start wins over deathmatch. */
++    public float[] spawnOrigin(){
++        float[] dm=null;
++        Matcher m=ENTITY_BLOCK.matcher(entities);
++        while(m.find()){
++            String cls=null,org=null,ang=null;
++            Matcher kv=KV.matcher(m.group(1));
++            while(kv.find()){
++                switch(kv.group(1)){case "classname"->cls=kv.group(2);case "origin"->org=kv.group(2);case "angle"->ang=kv.group(2);default->{}}
++            }
++            if(cls==null||org==null)continue;
++            boolean start=cls.equals("info_player_start"),deathmatch=cls.equals("info_player_deathmatch");
++            if(!start&&!deathmatch)continue;
++            String[] s=org.trim().split("\\s+");
++            if(s.length<3)continue;
++            try{
++                float[] r={Float.parseFloat(s[0]),Float.parseFloat(s[1]),Float.parseFloat(s[2]),ang==null?0f:Float.parseFloat(ang)};
++                if(start)return r;
++                if(dm==null)dm=r;
++            }catch(NumberFormatException ignored){}
++        }
++        return dm;
++    }
++
++    public Placement placement(List<Tri> tris,float scale){
++        float minX=Float.MAX_VALUE,minY=Float.MAX_VALUE,minZ=Float.MAX_VALUE,maxX=-Float.MAX_VALUE,maxZ=-Float.MAX_VALUE;
++        for(Tri t:tris)for(int i=0;i<9;i+=3){
++            minX=Math.min(minX,t.xyz[i]);maxX=Math.max(maxX,t.xyz[i]);
++            minY=Math.min(minY,t.xyz[i+1]);
++            minZ=Math.min(minZ,t.xyz[i+2]);maxZ=Math.max(maxZ,t.xyz[i+2]);
++        }
++        float s=Math.max(scale,.001f);
++        float[] sp=spawnOrigin();
++        if(sp!=null){
++            // Q3 player origin is 24 units above the floor it stands on
++            float feetY=sp[2]-24f;
++            return new Placement(mcx(sp[0]),minY,mcz(sp[1]),s,(feetY-minY)/s);
++        }
++        return new Placement((minX+maxX)*.5f,minY,(minZ+maxZ)*.5f,s,Float.NaN);
+     }
+ 
+     public List<Tri> triangles(){
+         List<Tri> out=new ArrayList<>();
+         for(Face f:faces){
+-            if (f.type == 2) {
+-                addPatch(out, f);
+-                continue;
+-            }
++            if(!drawable(f.texture))continue;
++            if(f.type==2){addPatch(out,f);continue;}
+             if(f.type!=1&&f.type!=3) continue;
+             if(f.vertex<0||f.vertex+f.vertexCount>vertices.size()) continue;
+             if(f.meshVert<0||f.meshVert+f.meshVertCount>meshVerts.size()) continue;
+             for(int i=0;i+2<f.meshVertCount;i+=3){
+                 int a=f.vertex+meshVerts.get(f.meshVert+i), b=f.vertex+meshVerts.get(f.meshVert+i+1), c=f.vertex+meshVerts.get(f.meshVert+i+2);
+                 if(a<0||b<0||c<0||a>=vertices.size()||b>=vertices.size()||c>=vertices.size())continue;
+-                Vertex va=vertices.get(a),vb=vertices.get(b),vc=vertices.get(c);
+-                out.add(new Tri(shaderName(f.texture),new float[]{mcx(va.x),mcy(va.z),mcz(va.y),mcx(vb.x),mcy(vb.z),mcz(vb.y),mcx(vc.x),mcy(vc.z),mcz(vc.y)},
+-                        new float[]{va.u,va.v,vb.u,vb.v,vc.u,vc.v}));
++                addTri(out,shaderName(f.texture),vertices.get(a),vertices.get(b),vertices.get(c));
+             }
+         }
+         return out;
+@@ -71,6 +135,7 @@ public final class Quake3Bsp {
+         int w=f.patchWidth,h=f.patchHeight;
+         if(w<3||h<3||(w&1)==0||(h&1)==0||f.vertex<0||f.vertex+(long)w*h>vertices.size())return;
+         final int steps=8;
++        String texture=shaderName(f.texture);
+         for(int py=0;py+2<h;py+=2) for(int px=0;px+2<w;px+=2) {
+             Vertex[][] grid=new Vertex[steps+1][steps+1];
+             for(int y=0;y<=steps;y++) for(int x=0;x<=steps;x++) {
+@@ -83,7 +148,6 @@ public final class Quake3Bsp {
+                 }
+                 grid[y][x]=new Vertex(a[0],a[1],a[2],0,0,0,a[3],a[4]);
+             }
+-            String texture=shaderName(f.texture);
+             for(int y=0;y<steps;y++)for(int x=0;x<steps;x++){
+                 Vertex a=grid[y][x],b=grid[y][x+1],c=grid[y+1][x+1],d=grid[y+1][x];
+                 addTri(out,texture,a,b,c);addTri(out,texture,a,c,d);
+@@ -91,15 +155,31 @@ public final class Quake3Bsp {
+         }
+     }
+     private static float[] bernstein(float t){float s=1-t;return new float[]{s*s,2*s*t,t*t};}
++
+     private static void addTri(List<Tri> out,String texture,Vertex a,Vertex b,Vertex c){
+-        out.add(new Tri(texture,new float[]{mcx(a.x),mcy(a.z),mcz(a.y),mcx(b.x),mcy(b.z),mcz(b.y),mcx(c.x),mcy(c.z),mcz(c.y)},new float[]{a.u,a.v,b.u,b.v,c.u,c.v}));
++        float[] p={mcx(a.x),mcy(a.z),mcz(a.y),mcx(b.x),mcy(b.z),mcz(b.y),mcx(c.x),mcy(c.z),mcz(c.y)};
++        float ux=p[3]-p[0],uy=p[4]-p[1],uz=p[5]-p[2],vx=p[6]-p[0],vy=p[7]-p[1],vz=p[8]-p[2];
++        // Q3 triangles are wound opposite to the right-hand rule, so the outward normal is (c-a)x(b-a)
++        float nx=vy*uz-vz*uy,ny=vz*ux-vx*uz,nz=vx*uy-vy*ux;
++        float len=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
++        if(len<1e-6f)return; // degenerate
++        out.add(new Tri(texture,p,new float[]{a.u,a.v,b.u,b.v,c.u,c.v},new float[]{nx/len,ny/len,nz/len}));
++    }
++
++    /** False for sky, nodraw, hint/skip and common/clip-style shaders that must neither render nor collide. */
++    private boolean drawable(int i){
++        if(i<0||i>=shaders.size())return true;
++        Shader s=shaders.get(i);
++        if((s.flags&(SURF_SKY|SURF_NODRAW|SURF_HINT|SURF_SKIP))!=0)return false;
++        return !HIDDEN_SHADER.matcher(s.name.toLowerCase(java.util.Locale.ROOT)).matches();
+     }
++
+     private String shaderName(int i){return i>=0&&i<shaders.size()?shaders.get(i).name:"q3_missing";}
+     private static float mcx(float x){return x;}
+     private static float mcy(float z){return z;}
+     private static float mcz(float y){return -y;}
+ 
+-    private static List<Shader> readShaders(byte[]d,int o,int l){ByteBuffer b=slice(d,o,l);List<Shader>r=new ArrayList<>();while(b.remaining()>=72){byte[]n=new byte[64];b.get(n);int e=0;while(e<n.length&&n[e]!=0)e++;String s=new String(n,0,e,StandardCharsets.UTF_8);r.add(new Shader(s,b.getInt(),b.getInt()));}return r;}
++    private static List<Shader> readShaders(byte[]d,int o,int l){ByteBuffer b=slice(d,o,l);List<Shader>r=new ArrayList<>();while(b.remaining()>=72){byte[]n=new byte[64];b.get(n);int e=0;while(e<n.length&&n[e]!=0)e++;String s=new String(n,0,e,StandardCharsets.UTF_8);int flags=b.getInt();int contents=b.getInt();r.add(new Shader(s,flags,contents));}return r;}
+     private static List<Face> readFaces(byte[]d,int o,int l){
+         ByteBuffer b=slice(d,o,l);List<Face> r=new ArrayList<>(l/104);
+         while(b.remaining()>=104){
+diff --git a/src/main/java/com/unrealcraft/quake3/Quake3Collision.java b/src/main/java/com/unrealcraft/quake3/Quake3Collision.java
+index 2e37b18..7b57efc 100644
+--- a/src/main/java/com/unrealcraft/quake3/Quake3Collision.java
++++ b/src/main/java/com/unrealcraft/quake3/Quake3Collision.java
+@@ -1,38 +1,58 @@
+ package com.unrealcraft.quake3;
+ 
+-import com.unrealcraft.config.UnrealConfig;
+-import net.minecraft.util.math.BlockPos;
+-import java.nio.file.Path;
+ import java.util.*;
+ 
++/**
++ * Surface voxelisation of the exact triangles the renderer draws (pure Java, testable).
++ * Voxel coordinates are relative to the map origin block: world = origin + voxel.
++ */
+ public final class Quake3Collision {
+     private Quake3Collision(){}
+-    public static List<BlockPos> build(Path bsp, BlockPos origin){
+-        if(!UnrealConfig.get().buildCollision)return List.of();
+-        try{
+-            var raw=Quake3Bsp.load(bsp).triangles();
+-            if(raw.isEmpty())return List.of();
+-            float minX=Float.MAX_VALUE,minY=Float.MAX_VALUE,minZ=Float.MAX_VALUE,maxX=-Float.MAX_VALUE,maxY=-Float.MAX_VALUE,maxZ=-Float.MAX_VALUE;
+-            for(var t:raw)for(int i=0;i<9;i+=3){minX=Math.min(minX,t.xyz()[i]);maxX=Math.max(maxX,t.xyz()[i]);minY=Math.min(minY,t.xyz()[i+1]);maxY=Math.max(maxY,t.xyz()[i+1]);minZ=Math.min(minZ,t.xyz()[i+2]);maxZ=Math.max(maxZ,t.xyz()[i+2]);}
+-            float cx=(minX+maxX)*.5f,cz=(minZ+maxZ)*.5f,fy=minY;
+-            float s=Math.max(UnrealConfig.get().q3UnitsPerBlock,.001f);
+-            Set<Long> seen=new HashSet<>();List<BlockPos> out=new ArrayList<>();
+-            for(var t:raw){
+-                float[] q=t.xyz().clone();for(int i=0;i<9;i+=3){q[i]=(q[i]-cx)/s;q[i+1]=(q[i+1]-fy)/s;q[i+2]=(q[i+2]-cz)/s;}
+-                surface(q,origin,seen,out,UnrealConfig.get().collisionBlockLimit);if(out.size()>=UnrealConfig.get().collisionBlockLimit)break;
+-            }
+-            return out;
+-        }catch(Exception e){return List.of();}
++
++    /** @return {x,y,z} voxel offsets from the origin block. Never throws. */
++    public static List<int[]> voxels(List<Quake3Bsp.Tri> tris, Quake3Bsp.Placement pl, int limit){
++        Set<Long> seen=new HashSet<>();List<int[]> out=new ArrayList<>();
++        for(var t:tris){
++            float[] q=new float[9];
++            for(int i=0;i<9;i+=3){q[i]=pl.lx(t.xyz()[i]);q[i+1]=pl.ly(t.xyz()[i+1]);q[i+2]=pl.lz(t.xyz()[i+2]);}
++            surface(q,seen,out,limit);
++            if(out.size()>=limit)break;
++        }
++        return out;
+     }
+-    private static void surface(float[]q,BlockPos o,Set<Long>seen,List<BlockPos>out,int limit){
++
++    private static void surface(float[]q,Set<Long>seen,List<int[]>out,int limit){
+         float ax=q[0],ay=q[1],az=q[2],bx=q[3],by=q[4],bz=q[5],cx=q[6],cy=q[7],cz=q[8];
+         float ux=bx-ax,uy=by-ay,uz=bz-az,vx=cx-ax,vy=cy-ay,vz=cz-az,nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+         int axis=Math.abs(ny)>=Math.abs(nx)&&Math.abs(ny)>=Math.abs(nz)?1:(Math.abs(nx)>=Math.abs(nz)?0:2);
+-        float minU,maxU,minV,maxV;if(axis==1){minU=Math.min(ax,Math.min(bx,cx));maxU=Math.max(ax,Math.max(bx,cx));minV=Math.min(az,Math.min(bz,cz));maxV=Math.max(az,Math.max(bz,cz));}
++        float minU,maxU,minV,maxV;
++        if(axis==1){minU=Math.min(ax,Math.min(bx,cx));maxU=Math.max(ax,Math.max(bx,cx));minV=Math.min(az,Math.min(bz,cz));maxV=Math.max(az,Math.max(bz,cz));}
+         else if(axis==0){minU=Math.min(ay,Math.min(by,cy));maxU=Math.max(ay,Math.max(by,cy));minV=Math.min(az,Math.min(bz,cz));maxV=Math.max(az,Math.max(bz,cz));}
+         else{minU=Math.min(ax,Math.min(bx,cx));maxU=Math.max(ax,Math.max(bx,cx));minV=Math.min(ay,Math.min(by,cy));maxV=Math.max(ay,Math.max(by,cy));}
+-        int u0=(int)Math.floor(minU),u1=(int)Math.ceil(maxU),v0=(int)Math.floor(minV),v1=(int)Math.ceil(maxV);float d=nx*ax+ny*ay+nz*az;
+-        for(int iu=u0;iu<=u1;iu++)for(int iv=v0;iv<=v1;iv++){float u=iu+.5f,v=iv+.5f,x,y,z;if(axis==1){x=u;z=v;if(Math.abs(ny)<1e-6)continue;y=(d-nx*x-nz*z)/ny;}else if(axis==0){y=u;z=v;if(Math.abs(nx)<1e-6)continue;x=(d-ny*y-nz*z)/nx;}else{x=u;y=v;if(Math.abs(nz)<1e-6)continue;z=(d-nx*x-ny*y)/nz;}if(!inside(q,x,y,z,axis))continue;BlockPos bp=BlockPos.ofFloored(x+o.getX(),y+o.getY(),z+o.getZ());if(seen.add(bp.asLong())){out.add(bp);if(out.size()>=limit)return;}}
++        int u0=(int)Math.floor(minU),u1=(int)Math.ceil(maxU),v0=(int)Math.floor(minV),v1=(int)Math.ceil(maxV);
++        float d=nx*ax+ny*ay+nz*az;
++        for(int iu=u0;iu<=u1;iu++)for(int iv=v0;iv<=v1;iv++){
++            float u=iu+.5f,v=iv+.5f,x,y,z;
++            if(axis==1){x=u;z=v;if(Math.abs(ny)<1e-6)continue;y=(d-nx*x-nz*z)/ny;}
++            else if(axis==0){y=u;z=v;if(Math.abs(nx)<1e-6)continue;x=(d-ny*y-nz*z)/nx;}
++            else{x=u;y=v;if(Math.abs(nz)<1e-6)continue;z=(d-nx*x-ny*y)/nz;}
++            if(!inside(q,x,y,z,axis))continue;
++            // -0.001 on Y: a floor lying exactly on a block boundary gets its barrier BELOW the surface,
++            // so the player stands on the visible floor instead of inside the barrier block.
++            int bx2=(int)Math.floor(x),by2=(int)Math.floor(y-0.001f),bz2=(int)Math.floor(z);
++            long key=(((long)bx2&0x3FFFFFFL)<<38)|(((long)bz2&0x3FFFFFFL)<<12)|((long)by2&0xFFFL);
++            if(seen.add(key)){out.add(new int[]{bx2,by2,bz2});if(out.size()>=limit)return;}
++        }
++    }
++
++    private static boolean inside(float[]q,float x,float y,float z,int axis){
++        float a1,a2,b1,b2,c1,c2,p1,p2;
++        if(axis==1){a1=q[0];a2=q[2];b1=q[3];b2=q[5];c1=q[6];c2=q[8];p1=x;p2=z;}
++        else if(axis==0){a1=q[1];a2=q[2];b1=q[4];b2=q[5];c1=q[7];c2=q[8];p1=y;p2=z;}
++        else{a1=q[0];a2=q[1];b1=q[3];b2=q[4];c1=q[6];c2=q[7];p1=x;p2=y;}
++        float den=(b2-c2)*(a1-c1)+(c1-b1)*(a2-c2);
++        if(Math.abs(den)<1e-6)return false;
++        float u=((b2-c2)*(p1-c1)+(c1-b1)*(p2-c2))/den,v=((c2-a2)*(p1-c1)+(a1-c1)*(p2-c2))/den;
++        return u>=-.02&&v>=-.02&&u+v<=1.02;
+     }
+-    private static boolean inside(float[]q,float x,float y,float z,int axis){float a1,a2,b1,b2,c1,c2,p1,p2;if(axis==1){a1=q[0];a2=q[2];b1=q[3];b2=q[5];c1=q[6];c2=q[8];p1=x;p2=z;}else if(axis==0){a1=q[1];a2=q[2];b1=q[4];b2=q[5];c1=q[7];c2=q[8];p1=y;p2=z;}else{a1=q[0];a2=q[1];b1=q[3];b2=q[4];c1=q[6];c2=q[7];p1=x;p2=y;}float den=(b2-c2)*(a1-c1)+(c1-b1)*(a2-c2);if(Math.abs(den)<1e-6)return false;float u=((b2-c2)*(p1-c1)+(c1-b1)*(p2-c2))/den,v=((c2-a2)*(p1-c1)+(a1-c1)*(p2-c2))/den;return u>=-.02&&v>=-.02&&u+v<=1.02;}
+ }
